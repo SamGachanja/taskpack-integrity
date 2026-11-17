@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taskpack-integrity"
+version = "0.1.0"
+description = "Inspect, plan, repair, and verify UUID references in task packages."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Samuel Gachanja"}]
+dependencies = []
+
+[project.scripts]
+taskpack-integrity = "uuid_swap:main"
+
+[tool.setuptools]
+py-modules = ["uuid_swap"]
