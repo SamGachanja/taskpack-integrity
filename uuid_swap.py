@@ -1,32 +1,16 @@
 #!/usr/bin/env python3
-"""Inspect and rewrite task-package UUIDs with TaskPack Integrity.
+"""Inspect and repair task-package UUIDs with TaskPack Integrity.
 
-Accepts a .zip or an extracted directory. The input is never modified: work is
-done on a copy in a temp directory and written out as a new zip.
-
-Output zips are byte-reproducible: entries are sorted and timestamps fixed, so
-running the same command twice produces an identical file with the same SHA-256.
-File permissions are kept, so test.sh stays executable.
-
-  check  <pkg> [--client C]          verify folder name, task.toml and the execution
-                                     logs all declare the SAME uuid, and that it is
-                                     the client's uuid C (exit 1 if not)
-  scan   <pkg>                       list every 32-hex id, in names and in contents
-  plan   <pkg> --from X --to C       show exactly what would change (no writes)
-  apply  <pkg> --from X --to C       do it, verify, and optionally re-zip
-
-The rule: a package carries exactly ONE uuid, and it is the CLIENT's uuid. The
-folder name, task.toml, the execution logs and every other file must carry it.
-A trainer-generated uuid is swapped back to the client's everywhere, including
-execution_logs/. --from can be repeated (or comma-separated) to swap several ids
-to the client's uuid in one run.
-
-`check` without --client asks for the client's uuid when run in a terminal.
-
-Every run writes a SHA-256 manifest before and after, so the report can state
-positively that no other file changed.
+Commands: scan, plan, apply, check. Use --help for arguments.
+Repairs run on a temporary copy and verify all file bytes, directory entries,
+and permission bits against the expected transformation before publishing.
+Archives use sorted entries and fixed timestamps for reproducible output within
+the same runtime and compression implementation. Symlinks and special files
+are rejected. Source discovery targets undashed lowercase 32-hex identifiers.
+Use --client to compare a package against its intended canonical identifier.
 """
-import argparse, hashlib, os, re, shutil, stat, sys, tempfile, zipfile
+import argparse, contextlib, hashlib, io, json, os, re, shutil, stat, sys, tempfile, zipfile
+from pathlib import PurePosixPath
 from collections import Counter, defaultdict
 
 HEX32 = re.compile(r'(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])')
@@ -50,8 +34,12 @@ def parse_ids(values):
     return list(dict.fromkeys(out))
 
 
+def walk_error(error):
+    raise error
+
+
 def walk(root):
-    for dp, dn, fn in os.walk(root):
+    for dp, dn, fn in os.walk(root, onerror=walk_error):
         dn.sort(); fn.sort()
         for n in fn:
             yield os.path.join(dp, n)
@@ -82,16 +70,14 @@ def scan(root):
     for m in HEX32.findall(os.path.basename(root)):
         names[m] += 1
         where[m].add('path name: <package root> ' + os.path.basename(root))
-    for dp, dn, fn in os.walk(root):
+    for dp, dn, fn in os.walk(root, onerror=walk_error):
         for n in list(dn) + list(fn):
             for m in HEX32.findall(n):
                 names[m] += 1
                 where[m].add('path name: ' + rel(root, os.path.join(dp, n)))
     for p in walk(root):
-        try:
-            b = open(p, 'rb').read()
-        except OSError:
-            continue
+        with open(p, 'rb') as stream:
+            b = stream.read()
         t = b.decode('utf-8', errors='ignore')
         for m in HEX32.findall(t):
             content[m] += 1
@@ -106,7 +92,7 @@ def find_changes(root, old, new, include_logs):
     if old in os.path.basename(root):
         renames.append((root, os.path.join(os.path.dirname(root),
                                            os.path.basename(root).replace(old, new))))
-    for dp, dn, fn in os.walk(root):
+    for dp, dn, fn in os.walk(root, onerror=walk_error):
         for n in list(dn) + list(fn):
             if old in n:
                 src = os.path.join(dp, n)
@@ -123,10 +109,8 @@ def find_changes(root, old, new, include_logs):
         r = rel(root, p)
         if not include_logs and in_logs(r):
             continue
-        try:
-            b = open(p, 'rb').read()
-        except OSError:
-            continue
+        with open(p, 'rb') as stream:
+            b = stream.read()
         if ob not in b:
             continue
         lines = []
@@ -170,31 +154,79 @@ def report_plan(root, old, new, renames, edits, include_logs):
         print("   (re-run without --keep-logs if these should change)")
 
 
+def validate_tree(root):
+    """Reject links and special files; never dereference outside the package."""
+    if os.path.islink(root):
+        raise ValueError("symlink package roots are not supported")
+    for dp, dn, fn in os.walk(root, onerror=walk_error):
+        for name in dn + fn:
+            path = os.path.join(dp, name)
+            mode = os.lstat(path).st_mode
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                raise ValueError(f"symlink or special file is not supported: {rel(root, path)}")
+
+
+def repair_inventory(root):
+    """Record every directory and file, including bytes and permission bits."""
+    validate_tree(root)
+    result = {"": ("directory", stat.S_IMODE(os.stat(root).st_mode), None)}
+    for dp, dn, fn in os.walk(root, onerror=walk_error):
+        for name in dn + fn:
+            path = os.path.join(dp, name)
+            kind = "directory" if os.path.isdir(path) else "file"
+            with open(path, "rb") if kind == "file" else contextlib.nullcontext() as stream:
+                result[rel(root, path)] = (kind, stat.S_IMODE(os.stat(path).st_mode),
+                                         stream.read() if stream else None)
+    return result
+
+
+def repaired_path(path, olds, new, include_logs):
+    if not include_logs and in_logs(path):
+        return path
+    for old in olds:
+        path = path.replace(old, new)
+    return path
+
+
 def apply(root, olds, new, include_logs):
-    """Swap every id in olds to new, one after another, on the same tree."""
+    """Preflight all destinations, repair, and verify every resulting entry."""
+    original = repair_inventory(root)
+    expected, destinations = {}, {}
+    for path, (kind, mode, data) in original.items():
+        target = repaired_path(path, olds, new, include_logs)
+        portable = target.casefold()
+        if portable in destinations:
+            raise ValueError(f"rename collision: {path!r} and {destinations[portable]!r} -> {target!r}")
+        destinations[portable] = path
+        if data is not None and (include_logs or not in_logs(path)):
+            for old in olds:
+                data = data.replace(old.encode(), new.encode())
+        expected[target] = (kind, mode, data)
     before = manifest(root)
-    ob_edits, all_renames, edited = [], [], set()
-    nb = new.encode()
+    ob_edits, all_renames = [], []
     for old in olds:
         renames, edits = find_changes(root, old, new, include_logs)
-        ob = old.encode()
         for r, _, _ in edits:
-            p = os.path.join(root, r)
-            b = open(p, 'rb').read()
-            open(p, 'wb').write(b.replace(ob, nb))
+            path = os.path.join(root, r)
+            with open(path, 'rb') as stream:
+                data = stream.read()
+            with open(path, 'wb') as stream:
+                stream.write(data.replace(old.encode(), new.encode()))
         for src, dst in renames:
+            if os.path.lexists(dst):
+                raise ValueError(f"rename destination already exists: {dst}")
             os.rename(src, dst)
             if src == root:
                 root = dst
         ob_edits += edits
         all_renames += renames
-        edited |= {r for r, _, _ in edits}
+    actual = repair_inventory(root)
+    unexpected = sorted(path for path in set(expected) | set(actual)
+                        if expected.get(path) != actual.get(path))
+    if unexpected:
+        raise ValueError("integrity verification failed: " + ", ".join(unexpected))
     after = manifest(root)
-
-    # account for files whose path changed due to a parent rename
     moved = {k for k in before if k not in after}
-    unexpected = [k for k in before
-                  if k in after and before[k] != after[k] and k not in edited]
     return before, after, ob_edits, all_renames, moved, unexpected, root
 
 
@@ -215,7 +247,7 @@ def identity(root):
     trials = {}
     ld = os.path.join(root, LOGDIR)
     if os.path.isdir(ld):
-        for dp, dn, _ in os.walk(ld):
+        for dp, dn, _ in os.walk(ld, onerror=walk_error):
             for d in sorted(dn):
                 got = HEX32.findall(d)
                 if got:
@@ -335,19 +367,47 @@ def check(root, client=None):
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)   # fixed timestamp -> reproducible archives
 
 
-def write_zip(root, out):
-    """Write a byte-reproducible zip: sorted entries, fixed mtimes, original permissions."""
-    base = os.path.basename(root)
-    paths = sorted(rel(root, p) for p in walk(root))
-    with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as z:
-        for r in paths:
-            src = os.path.join(root, r)
-            zi = zipfile.ZipInfo(os.path.join(base, r).replace(os.sep, '/'), ZIP_EPOCH)
-            zi.create_system = 3   # unix, so unzip honours the mode bits
-            zi.external_attr = (stat.S_IFREG | stat.S_IMODE(os.stat(src).st_mode)) << 16
-            zi.compress_type = zipfile.ZIP_DEFLATED
-            with open(src, 'rb') as f:
-                z.writestr(zi, f.read())
+def validate_output(src, output, overwrite=False):
+    source = os.path.realpath(src)
+    resolved_output = os.path.realpath(output)
+    if resolved_output == source or (os.path.isdir(src) and
+            os.path.commonpath([source, resolved_output]) == source):
+        raise ValueError('output must not replace or be inside the source package')
+    if os.path.lexists(output) and not overwrite:
+        raise ValueError('output already exists; use --overwrite to replace it')
+
+
+def write_zip(root, out, overwrite=False):
+    """Publish only a complete archive, retaining an existing output on failure."""
+    validate_tree(root)
+    if os.path.lexists(out) and not overwrite:
+        raise ValueError(f"output already exists; use --overwrite: {out}")
+    parent = os.path.dirname(os.path.abspath(out))
+    os.makedirs(parent, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.taskpack-', suffix='.zip', dir=parent)
+    os.close(fd)
+    try:
+        base = os.path.basename(root)
+        inventory = repair_inventory(root)
+        with zipfile.ZipFile(temporary, 'w', zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(inventory):
+                kind, mode, data = inventory[path]
+                name = '/'.join([base] + (path.split(os.sep) if path else []))
+                if kind == 'directory':
+                    name += '/'
+                entry = zipfile.ZipInfo(name, ZIP_EPOCH)
+                entry.create_system = 3
+                entry.external_attr = ((stat.S_IFDIR if kind == 'directory' else stat.S_IFREG) | mode) << 16
+                entry.compress_type = zipfile.ZIP_DEFLATED
+                archive.writestr(entry, data if data is not None else b'')
+        if overwrite:
+            os.replace(temporary, out)
+        else:
+            # Exclusive publication also handles another writer winning the race.
+            os.link(temporary, out)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     return out
 
 
@@ -359,31 +419,89 @@ def sha256_file(p):
     return h.hexdigest()
 
 
+MAX_ENTRIES = 10000
+MAX_FILE_BYTES = 128 * 1024 * 1024
+MAX_TOTAL_BYTES = 512 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 1000
+
+
 def materialise(src, workdir):
-    """Return a path to a writable package root copied from src (.zip or dir)."""
+    """Copy a directory or extract a validated, bounded, single-root ZIP."""
     if os.path.isdir(src):
+        validate_tree(src)
         dst = os.path.join(workdir, os.path.basename(src.rstrip('/')))
         shutil.copytree(src, dst)
         return dst
     if not zipfile.is_zipfile(src):
-        sys.exit(f"not a directory or zip: {src}")
+        raise ValueError(f"not a directory or zip: {src}")
     ex = os.path.join(workdir, '_x')
-    with zipfile.ZipFile(src) as z:
-        z.extractall(ex)
-        # extractall drops permissions: restore them from the archive
-        top = os.path.realpath(ex) + os.sep
-        for info in z.infolist():
+    with zipfile.ZipFile(src) as archive:
+        entries = archive.infolist()
+        if not entries or len(entries) > MAX_ENTRIES:
+            raise ValueError("ZIP is empty or exceeds the 10,000-entry limit")
+        seen, spellings, roots, total = {}, {}, set(), 0
+        for info in entries:
+            name = info.filename
+            parts = PurePosixPath(name).parts
+            if (not name or '\\' in name or name.startswith('/') or
+                    any(part in ('', '.', '..') or ':' in part for part in name.rstrip('/').split('/'))):
+                raise ValueError(f"unsafe ZIP path: {name!r}")
+            for index in range(1, len(parts) + 1):
+                spelling = '/'.join(parts[:index])
+                folded = spelling.casefold()
+                if folded in spellings and spellings[folded] != spelling:
+                    raise ValueError(f'case-colliding ZIP path: {name}')
+                spellings[folded] = spelling
+            key = '/'.join(parts).casefold()
+            if key in seen:
+                raise ValueError(f"duplicate or case-colliding ZIP path: {name}")
+            seen[key] = info.is_dir()
+            roots.add(parts[0])
+            if len(parts) == 1 and not info.is_dir():
+                raise ValueError("ZIP files must be inside one top-level package directory")
+            mode = info.external_attr >> 16
+            kind = stat.S_IFMT(mode)
+            if (kind not in (0, stat.S_IFREG, stat.S_IFDIR) or
+                    (kind != 0 and (kind == stat.S_IFDIR) != info.is_dir())):
+                raise ValueError(f"symlink or special ZIP entry is not supported: {name}")
+            if info.flag_bits & 1:
+                raise ValueError("encrypted ZIP entries are not supported")
+            total += info.file_size
+            if (info.file_size > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES or
+                    info.file_size > max(info.compress_size, 1) * MAX_COMPRESSION_RATIO):
+                raise ValueError("ZIP exceeds extraction size or compression-ratio limits")
+        if len(roots) != 1:
+            raise ValueError("expected exactly one top-level folder in the ZIP")
+        for key in seen:
+            parents = PurePosixPath(key).parents
+            if any(str(parent) in seen and not seen[str(parent)] for parent in parents):
+                raise ValueError("ZIP file/directory path collision")
+        os.makedirs(ex)
+        directory_modes = []
+        actual_total = 0
+        for info in entries:
+            destination = os.path.join(ex, *PurePosixPath(info.filename).parts)
             mode = stat.S_IMODE(info.external_attr >> 16)
-            if not mode or info.is_dir():
+            if info.is_dir():
+                os.makedirs(destination, exist_ok=True)
+                directory_modes.append((destination, mode or 0o755))
                 continue
-            p = os.path.realpath(os.path.join(ex, info.filename))
-            if p.startswith(top) and os.path.isfile(p):
-                os.chmod(p, mode)
-    tops = [d for d in os.listdir(ex) if not d.startswith(('.', '__MACOSX'))]
-    tops = [d for d in tops if os.path.isdir(os.path.join(ex, d))]
-    if len(tops) != 1:
-        sys.exit(f"expected exactly one top-level folder in the zip, found: {tops}")
-    return os.path.join(ex, tops[0])
+            os.makedirs(os.path.dirname(destination), exist_ok=True)
+            count = 0
+            with archive.open(info) as source, open(destination, 'xb') as target:
+                while True:
+                    chunk = source.read(1 << 20)
+                    if not chunk:
+                        break
+                    count += len(chunk)
+                    actual_total += len(chunk)
+                    if count > MAX_FILE_BYTES or actual_total > MAX_TOTAL_BYTES:
+                        raise ValueError("ZIP exceeds actual extraction size limits")
+                    target.write(chunk)
+            os.chmod(destination, mode or 0o644)
+        for destination, mode in sorted(directory_modes, key=lambda x: x[0].count(os.sep), reverse=True):
+            os.chmod(destination, mode)
+    return os.path.join(ex, next(iter(roots)))
 
 
 def _clean_path(raw):
@@ -489,21 +607,29 @@ def interactive():
         base = os.path.dirname(os.path.abspath(src))
         default_out = os.path.join(base, os.path.basename(root) + '.zip')
         out = _clean_path(_ask("\nWrite zip to", default_out))
-        if os.path.exists(out):
+        overwrite = False
+        if os.path.lexists(out):
             if not _ask(f"  {os.path.basename(out)} exists. Overwrite? (y/N)", "N").lower().startswith('y'):
                 print("  not written."); return
+            overwrite = True
+        validate_output(src, out, overwrite)
         os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-        write_zip(root, out)
+        write_zip(root, out, overwrite=overwrite)
         print(f"\n   zip    : {out}")
         print(f"   sha256 : {sha256_file(out)}")
-        print("\nDone. Run the static gate on this zip before delivering.")
+        print("\nDone. Run check on the archive before using it.")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
     if len(sys.argv) == 1:
-        interactive(); return
+        try:
+            interactive()
+        except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+            print(f'error: {exc}', file=sys.stderr)
+            raise SystemExit(1)
+        return
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('mode', choices=['check', 'scan', 'plan', 'apply'])
@@ -520,22 +646,48 @@ def main():
     ap.add_argument('--force', action='store_true', help=argparse.SUPPRESS)
     ap.add_argument('--zip', dest='zipout',
                     help='write a reproducible zip of the result to this path')
+    ap.add_argument('--overwrite', action='store_true', help='explicitly replace an existing output archive')
+    ap.add_argument('--require-check', action='store_true', help='apply: require a passing check against --to before publishing')
+    ap.add_argument('--json', action='store_true', help='emit one JSON result instead of human-readable output')
     a = ap.parse_args()
 
-    src = os.path.abspath(a.package.rstrip('/'))
-    if not os.path.exists(src):
-        sys.exit(f"no such path: {src}")
-
-    work = tempfile.mkdtemp(prefix='uuidswap_')
-    try:
-        _run(a, src, work)
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    capture = io.StringIO()
+    code, details, error = 0, {}, None
+    with contextlib.redirect_stdout(capture) if a.json else contextlib.nullcontext():
+        try:
+            src = os.path.abspath(a.package.rstrip('/'))
+            if not os.path.exists(src):
+                raise ValueError(f"no such path: {src}")
+            if a.mode != 'apply' and (a.overwrite or a.require_check):
+                raise ValueError('--overwrite and --require-check are only valid for apply')
+            if a.mode == 'apply' and not a.zipout:
+                raise ValueError('apply requires --zip OUTPUT to retain the repaired package')
+            if a.zipout:
+                output = os.path.abspath(a.zipout)
+                validate_output(src, output, a.overwrite)
+            with tempfile.TemporaryDirectory(prefix='taskpack_') as work:
+                details = _run(a, src, work) or {}
+                if details.get('valid') is False:
+                    code = 1
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else 1
+            if not isinstance(exc.code, int):
+                error = str(exc.code)
+        except (OSError, ValueError, zipfile.BadZipFile, RuntimeError) as exc:
+            code, error = 1, str(exc)
+    if a.json:
+        print(json.dumps({'command': a.mode, 'success': code == 0, 'exit_code': code,
+                          'error': error, 'result': details, 'messages': capture.getvalue().splitlines()}))
+    elif error:
+        print(f'error: {error}', file=sys.stderr)
+    if code:
+        raise SystemExit(code)
 
 
 def _run(a, src, work):
     # scan and plan are read-only: use the source directly when it is a directory
     if a.mode in ('scan', 'plan') and os.path.isdir(src):
+        validate_tree(src)
         root = src
     else:
         root = materialise(src, work)
@@ -546,14 +698,17 @@ def _run(a, src, work):
             client = norm_uuid(a.client)
             if not client:
                 sys.exit(f"--client must be a uuid (32 hex characters), got: {a.client!r}")
-        elif sys.stdin.isatty():
+        elif sys.stdin.isatty() and not a.json:
             raw = _ask("Client's uuid (Enter to skip)")
             if raw:
                 client = norm_uuid(raw)
                 if not client:
                     sys.exit(f"not a uuid: {raw!r}")
             print()
-        sys.exit(check(root, client))
+        valid = check(root, client) == 0
+        folder, declared, _, trials = identity(root)
+        return {'valid': valid, 'expected_uuid': client, 'folder_uuid': folder,
+                'manifest_uuid': declared, 'trial_uuids': trials}
 
     if a.mode == 'scan':
         names, content, where = scan(root)
@@ -570,7 +725,9 @@ def _run(a, src, work):
                 print("   ", l)
             if len(locs) > 14:
                 print(f"    ... and {len(locs)-14} more")
-        return
+        return {'identifiers': [{'uuid': k, 'path_occurrences': names[k],
+                                 'content_occurrences': content[k], 'locations': sorted(where[k])}
+                                for k in sorted(set(names) | set(content))]}
 
     olds = parse_ids(a.old)
     if not olds or not a.new:
@@ -599,13 +756,22 @@ def _run(a, src, work):
                   f"are rewritten to {new} too, so the package carries the client's uuid "
                   f"throughout.\n")
 
+    plans = []
     for old in olds:
         renames, edits = find_changes(root, old, new, include_logs)
+        plans.append({"source_id": old, "renames": [
+            {"from": rel(root, source), "to": rel(root, target)}
+            for source, target in renames], "edits": [
+            {"path": path, "occurrences": count} for path, count, _ in edits]})
         report_plan(root, old, new, renames, edits, include_logs)
         if len(olds) > 1:
             print()
     if a.mode == 'plan':
-        return
+        # Run the same preflight and verification on a disposable copy.
+        with tempfile.TemporaryDirectory(prefix='taskpack_plan_') as preview:
+            preview_root = materialise(root, preview)
+            apply(preview_root, olds, new, include_logs)
+        return {'source_ids': olds, 'target_id': new, 'includes_logs': include_logs, 'plans': plans}
 
     before, after, edits, renames, moved, unexpected, root = apply(root, olds, new, include_logs)
     print("\n=== applied ===")
@@ -618,13 +784,18 @@ def _run(a, src, work):
     if not unexpected:
         print("   verified: no file changed except the ones listed above")
 
+    if a.require_check and check(root, new) != 0:
+        raise ValueError('post-repair check failed; no archive was published')
     if a.zipout:
         out = os.path.abspath(a.zipout)
         os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
-        write_zip(root, out)
+        write_zip(root, out, overwrite=a.overwrite)
         print(f"\n   zip    : {out}")
         print(f"   sha256 : {sha256_file(out)}")
         print(f"   (reproducible: the same command yields a byte-identical zip)")
+        return {'output': out, 'sha256': sha256_file(out), 'files_before': len(before),
+                'files_after': len(after), 'edits': len(edits), 'renames': len(renames),
+                'integrity_verified': True, 'required_check_passed': True if a.require_check else None}
 
 
 if __name__ == '__main__':
