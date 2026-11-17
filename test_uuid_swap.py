@@ -5,7 +5,7 @@ import os, shutil, subprocess, sys, tempfile, zipfile, hashlib
 TOOL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'uuid_swap.py')
 OLD = 'a' * 32
 NEW = 'b' * 32
-SLUG = '-SWARMBENCH-TEST-TASK'
+SLUG = '-TASKPACK-INTEGRITY-TEST-TASK'
 
 
 def build_fixture(d):
@@ -13,7 +13,7 @@ def build_fixture(d):
     os.makedirs(os.path.join(root, 'tests'))
     os.makedirs(os.path.join(root, 'execution_logs', 'single-opencode-agent', NEW + '__trial1'))
     open(os.path.join(root, 'task.toml'), 'w').write(
-        f'[task]\nname = "swarmbench/{OLD}{SLUG}"\n')
+        f'[task]\nname = "taskpack-integrity/{OLD}{SLUG}"\n')
     open(os.path.join(root, 'tests', 'verify.py'), 'w').write('# no id here\n')
     open(os.path.join(root, 'tests', 'test.sh'), 'w').write('#!/bin/sh\nexit 0\n')
     os.chmod(os.path.join(root, 'tests', 'test.sh'), 0o755)
